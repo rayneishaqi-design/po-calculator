@@ -132,7 +132,8 @@ BRAND_CONFIG: Dict[str, dict] = {
     },
     "Bumi Tauhid": {
         "aliases": ["bumi tauhid", "bumitauhid"],
-        "sources": [],  # BigSeller belum diaktifkan pada versi pertama
+        "sources": ["BigSeller"],
+        "source_note": "Objective dan marketplace (BigSeller)",
         "warehouses": [
             "Bumi Tauhid", "Gudang Bekasi", "Gudang Makassar",
             "Gudang Medan", "Gudang Surabaya",
@@ -143,7 +144,8 @@ BRAND_CONFIG: Dict[str, dict] = {
     },
     "Safwan": {
         "aliases": ["safwan"],
-        "sources": [],  # BigSeller/Shopee belum diaktifkan pada versi pertama
+        "sources": ["BigSeller"],
+        "source_note": "Shopee melalui BigSeller",
         "warehouses": ["Gudang Safwan", "Oxar Surabaya", "Oxar Makassar"],
         "oxar_columns": ["Oxar Surabaya", "Oxar Makassar"],
     },
@@ -164,6 +166,23 @@ BRAND_CONFIG: Dict[str, dict] = {
             "Gudang Bekasi", "Gudang Makassar", "Gudang Medan", "Gudang Surabaya"
         ],
     },
+}
+
+# Sumber data per brand mengikuti daftar Source DR yang diberikan.
+# BigSeller ditampilkan sebagai sumber yang akan datang, tetapi parser-nya
+# belum diaktifkan pada versi ini.
+BRAND_SOURCE_NOTES = {
+    "CAVE": "Jubelio",
+    "Yummys": "Jubelio",
+    "Bumi Tauhid": "BigSeller — Objective dan marketplace (belum aktif)",
+    "Safwan": "BigSeller — Shopee (belum aktif)",
+    "NDR": "Jubelio",
+    "Essens": "Jubelio",
+    "BMYT": "Jubelio",
+    "Jamu Jago": "Desty",
+    "Aquila": "Jubelio",
+    "Attaqwa": "Belum dikonfirmasi",
+    "Aqshor": "Belum dikonfirmasi",
 }
 
 # Default status exclusions. The app excludes these statuses and keeps
@@ -492,19 +511,52 @@ with st.sidebar:
     )
 
 st.subheader("1. Upload data transaksi")
-left, right = st.columns(2)
-with left:
-    jubelio_file = st.file_uploader("Upload Excel Jubelio (.xlsx)", type=["xlsx"], key="jubelio")
-with right:
-    desty_file = st.file_uploader("Upload Excel Desty (.xlsx)", type=["xlsx"], key="desty")
+
+# Tampilkan hanya tempat upload yang sesuai dengan Source DR brand terpilih.
+# Jubelio dan Desty aktif; BigSeller ditampilkan sebagai placeholder nonaktif.
+source_files = {}
+active_sources = [src for src in brand_cfg.get("sources", []) if src in ["Jubelio", "Desty"]]
+
+if active_sources:
+    cols = st.columns(len(active_sources))
+    for col, source in zip(cols, active_sources):
+        with col:
+            source_files[source] = st.file_uploader(
+                f"Upload Excel {source} (.xlsx)",
+                type=["xlsx"],
+                key=f"upload_{selected_brand}_{source}",
+                help=f"Brand {selected_brand} menggunakan sumber {source} sesuai konfigurasi Source DR.",
+            )
+elif "BigSeller" in brand_cfg.get("sources", []):
+    st.info(
+        f"Sumber data {selected_brand}: {BRAND_SOURCE_NOTES.get(selected_brand, 'BigSeller')}. "
+        "Tempat upload BigSeller akan diaktifkan setelah format ekspor dan aturan kolom BigSeller selesai dibuat. "
+        "Untuk saat ini file BigSeller belum dapat dihitung agar hasil PO tidak keliru."
+    )
+    st.file_uploader(
+        "Upload Excel BigSeller (segera hadir)",
+        type=["xlsx", "csv"],
+        disabled=True,
+        key=f"upload_{selected_brand}_BigSeller_disabled",
+    )
+else:
+    st.warning(
+        f"Sumber data untuk {selected_brand} belum tercantum/terkonfirmasi pada daftar Source DR. "
+        "Silakan konfirmasi sumbernya sebelum brand ini diaktifkan."
+    )
+
+st.caption(
+    f"Brand: {selected_brand}  |  Sumber data: "
+    f"{BRAND_SOURCE_NOTES.get(selected_brand, ', '.join(brand_cfg.get('sources', [])) or 'Belum dikonfirmasi')}"
+)
 
 source_data = []
 source_errors = []
 source_infos = []
 
-if jubelio_file and "Jubelio" in brand_cfg["sources"]:
+if source_files.get("Jubelio"):
     try:
-        raw, sheet = read_excel_upload(jubelio_file, "Data1")
+        raw, sheet = read_excel_upload(source_files["Jubelio"], "Data1")
         prepared, info = prepare_source(raw, "Jubelio", selected_brand, brand_cfg["aliases"])
         prepared["_source"] = "Jubelio"
         source_data.append(prepared)
@@ -514,9 +566,9 @@ if jubelio_file and "Jubelio" in brand_cfg["sources"]:
     except Exception as exc:
         source_errors.append(f"Jubelio: {exc}")
 
-if desty_file and "Desty" in brand_cfg["sources"]:
+if source_files.get("Desty"):
     try:
-        raw, sheet = read_excel_upload(desty_file, "Daftar Pesanan")
+        raw, sheet = read_excel_upload(source_files["Desty"], "Daftar Pesanan")
         prepared, info = prepare_source(raw, "Desty", selected_brand, brand_cfg["aliases"])
         prepared["_source"] = "Desty"
         source_data.append(prepared)
@@ -525,16 +577,6 @@ if desty_file and "Desty" in brand_cfg["sources"]:
         source_infos.append(info)
     except Exception as exc:
         source_errors.append(f"Desty: {exc}")
-
-# Safwan is configured with two source choices. The second source may be a
-# separate Shopee export in Jubelio-compatible layout; BigSeller is intentionally
-# not implemented in this first release.
-if selected_brand == "Safwan" and jubelio_file:
-    st.info(
-        "Safwan saat ini disiapkan untuk sumber Jubelio dan Shopee. "
-        "BigSeller belum diaktifkan pada versi pertama. Pastikan file Shopee "
-        "yang diunggah memiliki struktur kolom yang kompatibel dengan format Jubelio."
-    )
 
 for err in source_errors:
     st.error(err)
@@ -676,10 +718,14 @@ if source_data:
             "dan Audit Pesanan Unik untuk penelusuran sumber angka."
         )
 else:
-    if not brand_cfg["sources"]:
+    if "BigSeller" in brand_cfg.get("sources", []):
         st.warning(
-            f"{selected_brand} belum diaktifkan pada versi pertama karena sumber datanya "
-            "menggunakan BigSeller/Shopee yang belum menjadi fokus rilis Jubelio + Desty."
+            f"{selected_brand} menggunakan {BRAND_SOURCE_NOTES.get(selected_brand, 'BigSeller')}. "
+            "Parser BigSeller belum tersedia, sehingga belum ada angka PO yang dihitung."
+        )
+    elif not brand_cfg["sources"]:
+        st.warning(
+            f"Sumber data {selected_brand} belum dikonfirmasi. Brand ini belum dapat diproses."
         )
     else:
         st.info(
@@ -696,6 +742,9 @@ with st.expander("ℹ️ Catatan aturan perhitungan"):
         - Status valid lain dihitung selama tanggal, nomor pesanan, dan warehouse tersedia.
         - Tanggal mengikuti tanggal transaksi di file; aplikasi tidak membuat tanggal tambahan.
         - Warehouse dicocokkan ke master Daily Order brand yang dipilih. Nama yang belum cocok harus dipetakan manual.
-        - BigSeller belum aktif pada versi pertama.
+        - Tempat upload hanya menampilkan sumber yang ditetapkan untuk brand pada daftar Source DR.
+        - CAVE, Yummys, NDR, Essens, BMYT, dan Aquila menggunakan Jubelio; Jamu Jago menggunakan Desty.
+        - Bumi Tauhid dan Safwan menggunakan BigSeller, tetapi parser BigSeller belum diaktifkan.
+        - Attaqwa dan Aqshor menunggu konfirmasi sumber data.
         """
     )
