@@ -88,8 +88,9 @@ BRAND_CONFIG: Dict[str, dict] = {
     "Hexxa": {
         "aliases": ["hexxa"],
         "sources": ["Jubelio"],
-        "warehouses": ["Gudang Safwan", "Oxar Surabaya", "Oxar Makassar"],
-        "oxar_columns": ["Oxar Surabaya", "Oxar Makassar"],
+        # Daily Order Hexxa: only Jakarta Timur and Surabaya are warehouse columns.
+        "warehouses": ["Jakarta Timur", "Surabaya"],
+        "oxar_columns": [],
     },
     "NDR": {
         "aliases": ["ndr"],
@@ -158,6 +159,7 @@ BRAND_CONFIG: Dict[str, dict] = {
     "Aqshor": {
         "aliases": ["aqshor"],
         "sources": ["Jubelio"],
+        # Master union is used for source-warehouse mapping and the combined view.
         "warehouses": [
             "Aqshor", "Gudang Bekasi", "Gudang Makassar",
             "Gudang Medan", "Gudang Surabaya",
@@ -165,6 +167,28 @@ BRAND_CONFIG: Dict[str, dict] = {
         "oxar_columns": [
             "Gudang Bekasi", "Gudang Makassar", "Gudang Medan", "Gudang Surabaya"
         ],
+        # Daily Order Aqshor has two distinct marketplace blocks with different headers.
+        "marketplace_layouts": {
+            "Shopee": {
+                "label": "Shopee",
+                "warehouses": [
+                    "Aqshor", "Gudang Bekasi", "Gudang Makassar",
+                    "Gudang Medan", "Gudang Surabaya",
+                ],
+                "oxar_columns": [
+                    "Gudang Bekasi", "Gudang Makassar", "Gudang Medan", "Gudang Surabaya"
+                ],
+                "include_oxar_totals": True,
+            },
+            "TikTok": {
+                "label": "TikTok",
+                "warehouses": [
+                    "Gudang Bekasi", "Gudang Makassar", "Gudang Medan", "Gudang Surabaya"
+                ],
+                "oxar_columns": [],
+                "include_oxar_totals": False,
+            },
+        },
     },
 }
 
@@ -188,12 +212,19 @@ BRAND_SOURCE_NOTES = {
 # Default status exclusions. The app excludes these statuses and keeps
 # other non-empty statuses, so new valid status labels can still be counted.
 DEFAULT_EXCLUDED = {
-    "Jubelio": ["CANCEL", "CANCELLED", "CANCELED", "RETURN", "RETURNED",
-                "RETUR", "UNPAID", "BELUM BAYAR"],
-    "Desty": ["CANCEL", "CANCELLATION", "CANCELLATIONS", "CANCELLED",
-              "CANCELED", "RETURN", "RETURNED", "RETUR", "UNPAID",
-              "BELUM BAYAR"],
+    # Paid, Completed, Processing, dan Shipped tetap dihitung.
+    # Hanya pembatalan, retur, dan pembayaran yang belum dilakukan dikeluarkan.
+    "Jubelio": [
+        "CANCEL", "CANCELLATION", "RETURN", "RETUR", "UNPAID",
+        "BELUM BAYAR", "BELUM DIBAYAR", "BELUM BAYAR",
+    ],
+    "Desty": [
+        "CANCEL", "CANCELLATION", "RETURN", "RETUR", "UNPAID",
+        "BELUM BAYAR", "BELUM DIBAYAR",
+    ],
 }
+
+UNMAPPED_LABEL = "⛔ Tidak dihitung — tidak ada di Daily Sales All Client"
 
 # Header candidates based on the actual sample files.
 JUBELIO_HEADERS = {
@@ -281,14 +312,18 @@ def normalize_marketplace(value: str, source: str) -> str:
     if source == "Jubelio":
         if "|" in label:
             label = label.split("|")[-1].strip()
-        known = {
-            "SHOPEE": "Shopee",
-            "TOKOPEDIA": "Tokopedia",
-            "LAZADA": "Lazada",
-            "BLIBLI": "Blibli",
-            "TIKTOK": "TikTok",
-        }
-        return known.get(label.upper(), label or "Jubelio")
+        upper = label.upper()
+        if "SHOPEE" in upper:
+            return "Shopee"
+        if "TIKTOK" in upper:
+            return "TikTok"
+        if "TOKOPEDIA" in upper:
+            return "Tokopedia"
+        if "LAZADA" in upper:
+            return "Lazada"
+        if "BLIBLI" in upper:
+            return "Blibli"
+        return label or "Jubelio"
     if source == "Desty":
         label = label.split("-", 1)[0].strip()
         return label.title() if label else "Desty"
@@ -330,10 +365,11 @@ def prepare_source(
 
     # Filter selected brand by store/channel text.
     work = work[brand_match(work["_brand_raw"], aliases)].copy()
+    # Warehouse kosong tetap dipertahankan agar masuk laporan pengecualian,
+    # bukan hilang diam-diam. Tanggal, nomor pesanan, dan status wajib tersedia.
     work = work[
         work["_date"].notna()
         & (work["_order"] != "")
-        & (work["_warehouse_raw"] != "")
         & (work["_status_raw"] != "")
     ].copy()
 
@@ -392,12 +428,14 @@ def auto_map_warehouse(raw_value: str, master: List[str]) -> Optional[str]:
 
 
 def build_mapping_table(work: pd.DataFrame, master: List[str]) -> pd.DataFrame:
-    raw_values = sorted(work["_warehouse_raw"].dropna().astype(str).unique())
+    # Isi kosong juga dimasukkan agar bisa dilaporkan sebagai warehouse tidak dikenal.
+    raw_values = sorted(work["_warehouse_raw"].fillna("").astype(str).unique())
     rows = []
     for raw in raw_values:
+        target = auto_map_warehouse(raw, master)
         rows.append({
-            "Warehouse pada file": raw,
-            "Masuk ke kolom Daily Order": auto_map_warehouse(raw, master) or "⚠ Belum dipetakan",
+            "Warehouse pada file": raw if raw else "(Kosong / tidak ada nama warehouse)",
+            "Masuk ke kolom Daily Order": target or UNMAPPED_LABEL,
         })
     return pd.DataFrame(rows)
 
@@ -405,9 +443,23 @@ def build_mapping_table(work: pd.DataFrame, master: List[str]) -> pd.DataFrame:
 def apply_mapping(work: pd.DataFrame, mapping_df: pd.DataFrame) -> pd.DataFrame:
     mapping = dict(zip(mapping_df["Warehouse pada file"], mapping_df["Masuk ke kolom Daily Order"]))
     result = work.copy()
-    result["_warehouse_target"] = result["_warehouse_raw"].map(mapping)
-    result = result[result["_warehouse_target"].isin(mapping_df["Masuk ke kolom Daily Order"])].copy()
-    result = result[~result["_warehouse_target"].astype(str).str.startswith("⚠")].copy()
+    raw_key = result["_warehouse_raw"].replace("", "(Kosong / tidak ada nama warehouse)")
+    result["_warehouse_target"] = raw_key.map(mapping)
+    # Hanya warehouse yang benar-benar ada pada master Daily Sales All Client
+    # yang boleh masuk ke rekap. Sisanya masuk sheet pengecualian.
+    result = result[result["_warehouse_target"].isin(
+        [v for v in mapping_df["Masuk ke kolom Daily Order"].unique()
+         if v != UNMAPPED_LABEL]
+    )].copy()
+    return result
+
+
+def get_unmapped_rows(work: pd.DataFrame, mapping_df: pd.DataFrame) -> pd.DataFrame:
+    mapping = dict(zip(mapping_df["Warehouse pada file"], mapping_df["Masuk ke kolom Daily Order"]))
+    result = work.copy()
+    raw_key = result["_warehouse_raw"].replace("", "(Kosong / tidak ada nama warehouse)")
+    result["_warehouse_target"] = raw_key.map(mapping)
+    result = result[result["_warehouse_target"].eq(UNMAPPED_LABEL)].copy()
     return result
 
 
@@ -431,7 +483,7 @@ def make_daily_table(
     categories: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     if work.empty:
-        return pd.DataFrame(columns=["Tanggal", "Category"] + warehouses + ["Total PO"])
+        return pd.DataFrame(columns=["Tanggal", "Category"] + warehouses + ["_total_po_calc"])
     key_col = "_po_key" if "_po_key" in work.columns else "_order"
     grouped = (
         work.groupby([work["_date"].dt.normalize(), "_warehouse_target"])[key_col]
@@ -446,7 +498,9 @@ def make_daily_table(
     result.insert(1, "Category", result["Tanggal"].map(
         lambda d: (categories or {}).get(d.strftime("%Y-%m-%d"), "Daily")
     ))
-    result["Total PO"] = result[warehouses].sum(axis=1)
+    # Denominator internal untuk menghitung kontribusi Oxar; tidak ditampilkan
+    # sebagai kolom Total PO pada tabel maupun file hasil.
+    result["_total_po_calc"] = result[warehouses].sum(axis=1)
     return result
 
 
@@ -456,19 +510,42 @@ def add_template_totals(frame: pd.DataFrame, brand_cfg: dict) -> pd.DataFrame:
     if oxar_cols:
         result["Total Oxar Warehouse"] = result[oxar_cols].sum(axis=1)
         result["Contribute"] = result.apply(
-            lambda row: row["Total Oxar Warehouse"] / row["Total PO"]
-            if row["Total PO"] else 0,
+            lambda row: row["Total Oxar Warehouse"] / row["_total_po_calc"]
+            if row.get("_total_po_calc", 0) else 0,
             axis=1,
         )
-    return result
+    # Hilangkan kolom bantu agar Total PO tidak muncul di output.
+    return result.drop(columns=["_total_po_calc"], errors="ignore")
 
 
-def make_marketplace_tables(work: pd.DataFrame, warehouses: List[str]) -> Dict[str, pd.DataFrame]:
+def make_marketplace_tables(
+    work: pd.DataFrame,
+    brand_cfg: dict,
+    categories: Optional[Dict[str, str]] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Build marketplace sheets; some brands have different column layouts per channel."""
     outputs = {}
+    layouts = brand_cfg.get("marketplace_layouts", {})
+
+    if layouts:
+        for marketplace, layout in layouts.items():
+            part = work[work["_marketplace"].map(norm) == norm(marketplace)].copy()
+            frame = make_daily_table(part, layout["warehouses"], categories)
+            if layout.get("include_oxar_totals", False):
+                frame = add_template_totals(
+                    frame,
+                    {"oxar_columns": layout.get("oxar_columns", [])},
+                )
+            else:
+                frame = frame.drop(columns=["_total_po_calc"], errors="ignore")
+            safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", layout.get("label", marketplace))[:25]
+            outputs[safe_label] = frame
+        return outputs
+
     for marketplace, part in work.groupby("_marketplace", dropna=False):
         label = clean_text(marketplace) or "Marketplace"
         safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", label)[:25]
-        outputs[safe_label] = make_daily_table(part, warehouses)
+        outputs[safe_label] = make_daily_table(part, brand_cfg["warehouses"], categories)
     return outputs
 
 
@@ -611,7 +688,7 @@ if source_data:
         column_config={
             "Masuk ke kolom Daily Order": st.column_config.SelectboxColumn(
                 "Masuk ke kolom Daily Order",
-                options=["⚠ Belum dipetakan"] + brand_cfg["warehouses"],
+                options=[UNMAPPED_LABEL] + brand_cfg["warehouses"],
                 required=True,
             )
         },
@@ -619,22 +696,34 @@ if source_data:
     )
 
     unmapped = edited_mapping[
-        edited_mapping["Masuk ke kolom Daily Order"].astype(str).str.startswith("⚠")
+        edited_mapping["Masuk ke kolom Daily Order"].eq(UNMAPPED_LABEL)
     ]
-    if len(unmapped):
-        st.warning(
-            f"Ada {len(unmapped)} nama warehouse yang belum dipetakan. "
-            "Pilih kolom Daily Order yang benar sebelum ekspor."
-        )
-        st.dataframe(unmapped, use_container_width=True, hide_index=True)
-
-    if len(unmapped):
-        st.error("Proses ekspor dihentikan sampai semua warehouse dipetakan dengan benar.")
-        st.stop()
 
     mapped = apply_mapping(all_raw, edited_mapping)
+    unmapped_rows = get_unmapped_rows(all_raw, edited_mapping)
     if not mapped.empty:
         mapped = deduplicate_orders(mapped, across_marketplaces=across_marketplaces)
+    if not unmapped_rows.empty:
+        unmapped_rows = deduplicate_orders(
+            unmapped_rows, across_marketplaces=across_marketplaces
+        )
+
+    st.subheader("Ringkasan warehouse tidak terpetakan")
+    if not unmapped_rows.empty:
+        st.warning(
+            f"Ada {unmapped_rows['_po_key'].nunique()} PO unik yang tidak dihitung "
+            "karena nama warehouse tidak tersedia pada sheet Daily Sales All Client. "
+            "Data ini hanya dicatat sebagai pengecualian."
+        )
+        unmapped_summary = (
+            unmapped_rows.groupby("_warehouse_raw", dropna=False)
+            .agg( jumlah_PO=("_po_key", "nunique"))
+            .reset_index()
+            .rename(columns={"_warehouse_raw": "Warehouse pada file", "jumlah_PO": "Jumlah PO unik"})
+        )
+        st.dataframe(unmapped_summary, use_container_width=True, hide_index=True)
+    else:
+        st.success("Tidak ada PO dengan warehouse di luar master Daily Sales All Client.")
 
     st.subheader("4. Hasil perhitungan PO")
     if mapped.empty:
@@ -674,15 +763,15 @@ if source_data:
         # Add template totals to consolidated and per-marketplace outputs.
         daily = add_template_totals(daily, brand_cfg)
 
-        st.metric("Total PO unik", f"{int(mapped['_po_key'].nunique()):,}")
         st.dataframe(daily, use_container_width=True, hide_index=True)
 
         st.subheader("5. Rincian sumber marketplace")
-        marketplace_tables = make_marketplace_tables(mapped, warehouses)
-        marketplace_tables = {
-            name: add_template_totals(frame, brand_cfg)
-            for name, frame in marketplace_tables.items()
-        }
+        marketplace_tables = make_marketplace_tables(mapped, brand_cfg, category_map)
+        if not brand_cfg.get("marketplace_layouts"):
+            marketplace_tables = {
+                name: add_template_totals(frame, brand_cfg)
+                for name, frame in marketplace_tables.items()
+            }
         if marketplace_tables:
             tabs = st.tabs(list(marketplace_tables.keys()))
             for tab, (market_name, frame) in zip(tabs, marketplace_tables.items()):
@@ -704,6 +793,22 @@ if source_data:
         ]
         sheets["Audit Pesanan Unik"] = audit.sort_values(["Tanggal", "Marketplace"])
 
+        if not unmapped_rows.empty:
+            unmapped_audit = unmapped_rows[[
+                "_date", "_order", "_po_key", "_marketplace", "_source",
+                "_warehouse_raw", "_status_raw"
+            ]].copy()
+            unmapped_audit.columns = [
+                "Tanggal", "Nomor Pesanan", "Kunci PO", "Marketplace", "Sumber File",
+                "Warehouse pada file", "Status"
+            ]
+            unmapped_audit["Keterangan"] = (
+                "Tidak ada nama warehouse pada sheet Daily Sales All Client; tidak dihitung"
+            )
+            sheets["Tidak Terpetakan"] = unmapped_audit.sort_values(
+                ["Tanggal", "Marketplace"]
+            )
+
         output = excel_bytes(sheets)
         st.download_button(
             label="⬇️ Download Excel Hasil PO",
@@ -714,8 +819,9 @@ if source_data:
             use_container_width=True,
         )
         st.caption(
-            "File Excel berisi rekap Daily Order gabungan, sheet per marketplace, "
-            "dan Audit Pesanan Unik untuk penelusuran sumber angka."
+            "File Excel berisi rekap Daily Order, sheet per marketplace, Audit Pesanan Unik, "
+            "serta sheet Tidak Terpetakan untuk PO yang warehouse-nya tidak ada di Daily Sales All Client. "
+            "Total PO tidak ditampilkan sebagai kolom pada rekap."
         )
 else:
     if "BigSeller" in brand_cfg.get("sources", []):
@@ -737,14 +843,17 @@ with st.expander("ℹ️ Catatan aturan perhitungan"):
     st.markdown(
         """
         - Satu nomor pesanan dihitung satu PO meskipun terdiri dari beberapa baris produk.
+        - Kolom Total PO tidak ditampilkan pada hasil; rekap hanya menampilkan kolom warehouse dan kolom tambahan template yang relevan.
         - Jubelio menggunakan `No Pesanan`; Desty memprioritaskan `Nomor Pesanan (di Marketplace)` dan memakai nomor Desty sebagai cadangan jika kosong.
         - Status yang mengandung Cancel, Return/Retur, Unpaid, atau Belum Bayar dikeluarkan.
-        - Status valid lain dihitung selama tanggal, nomor pesanan, dan warehouse tersedia.
+        - Status Paid, Completed, Processing, dan Shipped tetap dihitung.
+        - Status Cancel, Return/Retur, Unpaid, dan Belum Bayar/Belum Dibayar dikeluarkan.
         - Tanggal mengikuti tanggal transaksi di file; aplikasi tidak membuat tanggal tambahan.
-        - Warehouse dicocokkan ke master Daily Order brand yang dipilih. Nama yang belum cocok harus dipetakan manual.
+        - Warehouse yang tidak tersedia pada master Daily Sales All Client tidak dihitung dan dicatat di bagian/worksheet Tidak Terpetakan.
         - Tempat upload hanya menampilkan sumber yang ditetapkan untuk brand pada daftar Source DR.
         - CAVE, Yummys, NDR, Essens, BMYT, dan Aquila menggunakan Jubelio; Jamu Jago menggunakan Desty.
         - Bumi Tauhid dan Safwan menggunakan BigSeller, tetapi parser BigSeller belum diaktifkan.
-        - Attaqwa dan Aqshor menunggu konfirmasi sumber data.
+        - Attaqwa menunggu konfirmasi sumber data.
+        - Aqshor menggunakan Jubelio dan hasil marketplace dipisah menjadi sheet Shopee dan TikTok dengan susunan warehouse yang berbeda.
         """
     )
