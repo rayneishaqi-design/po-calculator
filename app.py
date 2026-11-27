@@ -33,7 +33,7 @@ st.caption(
 
 BRAND_CONFIG: Dict[str, dict] = {
     "CAVE": {
-        "aliases": ["cave"],
+        "aliases": ["cave", "cao-70106"],
         "sources": ["Jubelio"],
         "warehouses": [
             "CAVE", "Makassar", "Medan", "Oxar Central Warehouse",
@@ -363,8 +363,16 @@ def prepare_source(
     else:
         work["_channel_raw"] = work["_brand_raw"]
 
-    # Filter selected brand by store/channel text.
-    work = work[brand_match(work["_brand_raw"], aliases)].copy()
+    # Filter selected brand using both store name and warehouse/location.
+    # Some Jubelio rows (e.g. INTERNAL/Toko Default and Blibli CAO-70106)
+    # do not carry the brand name in Nama Toko, but the brand is identifiable
+    # from its brand-specific warehouse or an explicit store alias.
+    brand_identity = (
+        work["_brand_raw"].fillna("").astype(str)
+        + " | "
+        + work["_warehouse_raw"].fillna("").astype(str)
+    )
+    work = work[brand_match(brand_identity, aliases)].copy()
     # Warehouse kosong tetap dipertahankan agar masuk laporan pengecualian,
     # bukan hilang diam-diam. Tanggal, nomor pesanan, dan status wajib tersedia.
     work = work[
